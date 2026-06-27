@@ -140,3 +140,8 @@ If you change public behavior, update the corresponding doc page and matching co
 - All public types are generated from the OpenAPI spec; hand-editing generated code is discouraged.
 - The Client uses typed errors - check with errors.As for *APIError to read status and request id.
 
+
+## Getting Started
+
+The SDK mirrors the E2B API surface; see the quickstart doc for the minimal sandbox lifecycle example before using higher-level helpers.
+
