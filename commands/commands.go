@@ -1,0 +1,868 @@
+package commands
+
+import (
+	"bytes"
+	"context"
+	"encoding/binary"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"reflect"
+	"strings"
+	"time"
+
+	"github.com/superduck-ai/e2b-go-sdk/envd"
+	"github.com/superduck-ai/e2b-go-sdk/envd/process"
+	"github.com/superduck-ai/e2b-go-sdk/internal/shared"
+)
+
+const (
+	defaultProcessConnectionTimeoutMs = 60000
+	keepalivePingIntervalSec          = 50
+	keepalivePingHeader               = "Keepalive-Ping-Interval"
+)
+
+type CommandRequestOpts struct {
+	RequestTimeoutMs *int
+	Signal           context.Context
+}
+
+type CommandStartOpts struct {
+	CommandRequestOpts
+	Background bool
+	Cwd        string
+	User       string
+	Envs       map[string]string
+	OnStdout   func(data Stdout)
+	OnStderr   func(data Stderr)
+	Stdin      *bool
+	TimeoutMs  *int
+}
+
+type CommandConnectOpts struct {
+	CommandRequestOpts
+	OnStdout  func(data Stdout)
+	OnStderr  func(data Stderr)
+	TimeoutMs *int
+}
+
+type ProcessInfo struct {
+	Pid  uint32
+	Tag  string
+	Cmd  string
+	Args []string
+	Envs map[string]string
+	Cwd  string
+}
+
+// commandExecution narrows the single-entry Run surface without exporting a
+// Go-only named union type. It is implemented by *CommandResult and
+// *CommandHandle.
+type commandExecution interface {
+	isCommandExecution()
+}
+
+type connectionConfig struct {
+	ApiKey           string
+	AccessToken      string
+	Domain           string
+	ApiUrl           string
+	SandboxUrl       string
+	Debug            bool
+	RequestTimeoutMs int
+	Headers          map[string]string
+	Logger           shared.Logger
+	Proxy            string
+}
+
+type Commands struct {
+	connectionConfig *connectionConfig
+	envdVersion      string
+	httpClient       *http.Client
+}
+
+type streamEnvelope struct {
+	payload json.RawMessage
+	err     error
+}
+
+func NewCommands(cfg any, envdVersion string) *Commands {
+	resolved := newConnectionConfig(cfg)
+	var logger shared.Logger
+	var proxy string
+	if resolved != nil {
+		logger = resolved.Logger
+		proxy = resolved.Proxy
+	}
+	return &Commands{
+		connectionConfig: resolved,
+		envdVersion:      envdVersion,
+		httpClient:       shared.NewEnvdRPCHTTPClient(0, proxy, logger),
+	}
+}
+
+func newConnectionConfig(cfg any) *connectionConfig {
+	if cfg == nil {
+		return nil
+	}
+
+	value := reflect.ValueOf(cfg)
+	if value.Kind() == reflect.Pointer {
+		if value.IsNil() {
+			return nil
+		}
+		value = value.Elem()
+	}
+	if value.Kind() != reflect.Struct {
+		return &connectionConfig{}
+	}
+
+	return &connectionConfig{
+		ApiKey:           stringField(value, "ApiKey"),
+		AccessToken:      stringField(value, "AccessToken"),
+		Domain:           stringField(value, "Domain"),
+		ApiUrl:           stringField(value, "ApiUrl"),
+		SandboxUrl:       stringField(value, "SandboxUrl"),
+		Debug:            boolField(value, "Debug"),
+		RequestTimeoutMs: intField(value, "RequestTimeoutMs"),
+		Headers:          stringMapField(value, "Headers"),
+		Logger:           loggerField(value, "Logger"),
+		Proxy:            stringField(value, "Proxy"),
+	}
+}
+
+func stringField(value reflect.Value, name string) string {
+	field := value.FieldByName(name)
+	if !field.IsValid() || field.Kind() != reflect.String {
+		return ""
+	}
+	return field.String()
+}
+
+func boolField(value reflect.Value, name string) bool {
+	field := value.FieldByName(name)
+	if !field.IsValid() || field.Kind() != reflect.Bool {
+		return false
+	}
+	return field.Bool()
+}
+
+func intField(value reflect.Value, name string) int {
+	field := value.FieldByName(name)
+	if !field.IsValid() || field.Kind() != reflect.Int {
+		return 0
+	}
+	return int(field.Int())
+}
+
+func stringMapField(value reflect.Value, name string) map[string]string {
+	field := value.FieldByName(name)
+	if !field.IsValid() || field.Kind() != reflect.Map || field.IsNil() {
+		return nil
+	}
+	if headers, ok := field.Interface().(map[string]string); ok {
+		return headers
+	}
+	return nil
+}
+
+func loggerField(value reflect.Value, name string) shared.Logger {
+	field := value.FieldByName(name)
+	if !field.IsValid() || !field.CanInterface() || isNilField(field) {
+		return nil
+	}
+	if logger, ok := field.Interface().(shared.Logger); ok {
+		return logger
+	}
+	return nil
+}
+
+func isNilField(field reflect.Value) bool {
+	switch field.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return field.IsNil()
+	default:
+		return false
+	}
+}
+
+func (c *Commands) baseUrl() string {
+	return c.connectionConfig.SandboxUrl
+}
+
+func (c *Commands) headers(user string) map[string]string {
+	h := make(map[string]string)
+	for k, v := range c.connectionConfig.Headers {
+		h[k] = v
+	}
+	for k, v := range envd.AuthenticationHeader(c.envdVersion, user) {
+		h[k] = v
+	}
+	return h
+}
+
+func requestContext(ctx context.Context, timeoutMs *int) (context.Context, context.CancelFunc) {
+	if timeoutMs == nil {
+		return ctx, func() {}
+	}
+	if *timeoutMs == 0 {
+		return context.WithCancel(ctx)
+	}
+	return context.WithTimeout(ctx, time.Duration(*timeoutMs)*time.Millisecond)
+}
+
+func requestContextWithSignal(ctx context.Context, signal context.Context, timeoutMs *int) (context.Context, context.CancelFunc) {
+	merged, cancelSignal := shared.MergeContexts(ctx, signal)
+	reqCtx, cancelTimeout := requestContext(merged, timeoutMs)
+	return reqCtx, func() {
+		cancelTimeout()
+		cancelSignal()
+	}
+}
+
+func requestTimeoutStreamContextWithSignal(ctx context.Context, signal context.Context, timeoutMs *int) (context.Context, func(), context.CancelFunc) {
+	merged, cancelSignal := shared.MergeContexts(ctx, signal)
+	requestCtx, clearRequestTimeout, cancelRequestTimeout := requestTimeoutStreamContext(merged, timeoutMs)
+	return requestCtx, clearRequestTimeout, func() {
+		cancelRequestTimeout()
+		cancelSignal()
+	}
+}
+
+func (c *Commands) connectUnary(ctx context.Context, path string, reqBody interface{}, respBody interface{}, user string) error {
+	data, err := json.Marshal(reqBody)
+	if err != nil {
+		return err
+	}
+	url := c.baseUrl() + path
+	req, err := newRetryableRequest(ctx, http.MethodPost, url, data)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	for k, v := range c.headers(user) {
+		req.Header.Set(k, v)
+	}
+	var resp *http.Response
+	err = envd.RetryRPCTransportErrorWithBeforeAttempt(req.Context(), func() error {
+		if req.GetBody == nil {
+			return nil
+		}
+		body, err := req.GetBody()
+		if err != nil {
+			return err
+		}
+		req.Body = body
+		return nil
+	}, func() error {
+		var innerErr error
+		resp, innerErr = c.httpClient.Do(req)
+		return innerErr
+	})
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode >= 400 {
+		// Try to parse Connect error
+		var connectErr struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		}
+		if json.Unmarshal(body, &connectErr) == nil && connectErr.Code != "" {
+			return wrapProcessError(envd.HandleRpcError(connectErr.Code, connectErr.Message))
+		}
+		return fmt.Errorf("connect RPC error: %d %s", resp.StatusCode, string(body))
+	}
+	if respBody != nil {
+		return json.Unmarshal(body, respBody)
+	}
+	return nil
+}
+
+// connectServerStream opens a server-streaming Connect RPC call and returns the response body for reading envelopes.
+func (c *Commands) connectServerStream(ctx context.Context, path string, reqBody interface{}, user string) (io.ReadCloser, error) {
+	data, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, err
+	}
+	url := c.baseUrl() + path
+	req, err := newRetryableRequest(ctx, http.MethodPost, url, envd.EncodeConnectEnvelope(data))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/connect+json")
+	req.Header.Set(keepalivePingHeader, fmt.Sprintf("%d", keepalivePingIntervalSec))
+	for k, v := range c.headers(user) {
+		req.Header.Set(k, v)
+	}
+	var resp *http.Response
+	err = envd.RetryRPCTransportErrorWithBeforeAttempt(req.Context(), func() error {
+		if req.GetBody == nil {
+			return nil
+		}
+		body, err := req.GetBody()
+		if err != nil {
+			return err
+		}
+		req.Body = body
+		return nil
+	}, func() error {
+		var innerErr error
+		resp, innerErr = c.httpClient.Do(req)
+		return innerErr
+	})
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		var connectErr struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		}
+		if json.Unmarshal(body, &connectErr) == nil && connectErr.Code != "" {
+			return nil, wrapProcessError(envd.HandleRpcError(connectErr.Code, connectErr.Message))
+		}
+		return nil, fmt.Errorf("connect RPC error: %d %s", resp.StatusCode, string(body))
+	}
+	return resp.Body, nil
+}
+
+func newRetryableRequest(ctx context.Context, method, url string, data []byte) (*http.Request, error) {
+	return http.NewRequestWithContext(ctx, method, url, bytes.NewReader(data))
+}
+
+// readStreamEnvelopes reads Connect protocol envelopes (5-byte header: 1 flag + 4 length, then payload).
+func readStreamEnvelopes(reader io.Reader, ch chan<- streamEnvelope) {
+	readStreamEnvelopesWithLogger(reader, ch, nil)
+}
+
+func readStreamEnvelopesWithLogger(reader io.Reader, ch chan<- streamEnvelope, logger shared.Logger) {
+	defer close(ch)
+	header := make([]byte, 5)
+	for {
+		_, err := io.ReadFull(reader, header)
+		if err != nil {
+			if err != io.EOF && err != io.ErrUnexpectedEOF {
+				ch <- streamEnvelope{err: err}
+			}
+			return
+		}
+		flags := header[0]
+		length := binary.BigEndian.Uint32(header[1:5])
+		payload := make([]byte, length)
+		_, err = io.ReadFull(reader, payload)
+		if err != nil {
+			if err != io.EOF && err != io.ErrUnexpectedEOF {
+				ch <- streamEnvelope{err: err}
+			}
+			return
+		}
+		// flags & 0x02 means end-of-stream / trailers
+		if flags&0x02 != 0 {
+			if err := envd.ParseConnectEndStreamError(payload); err != nil {
+				ch <- streamEnvelope{err: err}
+			}
+			return
+		}
+		if logger != nil {
+			logger.Debug("Response stream:", string(payload))
+		}
+		ch <- streamEnvelope{payload: json.RawMessage(payload)}
+	}
+}
+
+func (c *Commands) List(ctx context.Context, opts *CommandRequestOpts) ([]ProcessInfo, error) {
+	var signal context.Context
+	if opts != nil {
+		signal = opts.Signal
+	}
+	reqCtx, cancel := requestContextWithSignal(ctx, signal, c.requestTimeout(opts))
+	defer cancel()
+
+	var resp process.ListResponse
+	if err := c.connectUnary(reqCtx, "/process.Process/List", &process.ListRequest{}, &resp, ""); err != nil {
+		return nil, err
+	}
+	result := make([]ProcessInfo, 0, len(resp.Processes))
+	for _, p := range resp.Processes {
+		info := ProcessInfo{
+			Pid: p.Pid,
+			Tag: p.Tag,
+		}
+		if p.Config != nil {
+			info.Cmd = p.Config.Cmd
+			info.Args = p.Config.Args
+			info.Envs = p.Config.Envs
+			info.Cwd = p.Config.Cwd
+		}
+		result = append(result, info)
+	}
+	return result, nil
+}
+
+func (c *Commands) SendStdin(ctx context.Context, pid uint32, data []byte, opts *CommandRequestOpts) error {
+	var signal context.Context
+	if opts != nil {
+		signal = opts.Signal
+	}
+	reqCtx, cancel := requestContextWithSignal(ctx, signal, c.requestTimeout(opts))
+	defer cancel()
+
+	req := &process.SendInputRequest{
+		Process: process.PidSelector(pid),
+		Input:   &process.ProcessInput{Stdin: data},
+	}
+	return c.connectUnary(reqCtx, "/process.Process/SendInput", req, nil, "")
+}
+
+func (c *Commands) closeStdin(ctx context.Context, pid uint32, opts *CommandRequestOpts) error {
+	if !versionGTE(c.envdVersion, envd.EnvdClose) {
+		return fmt.Errorf("Sandbox envd version %s doesn't support closeStdin. Please rebuild your template to pick up the latest sandbox version.", c.envdVersion)
+	}
+	var signal context.Context
+	if opts != nil {
+		signal = opts.Signal
+	}
+	reqCtx, cancel := requestContextWithSignal(ctx, signal, c.requestTimeout(opts))
+	defer cancel()
+	req := &process.CloseStdinRequest{Process: process.PidSelector(pid)}
+	return c.connectUnary(reqCtx, "/process.Process/CloseStdin", req, nil, "")
+}
+
+func (c *Commands) CloseStdin(ctx context.Context, pid uint32, opts *CommandRequestOpts) error {
+	return c.closeStdin(ctx, pid, opts)
+}
+
+func (c *Commands) Kill(ctx context.Context, pid uint32, opts *CommandRequestOpts) (bool, error) {
+	var signal context.Context
+	if opts != nil {
+		signal = opts.Signal
+	}
+	reqCtx, cancel := requestContextWithSignal(ctx, signal, c.requestTimeout(opts))
+	defer cancel()
+
+	req := &process.SendSignalRequest{
+		Process: process.PidSelector(pid),
+		Signal:  process.SignalSIGKILL,
+	}
+	err := c.connectUnary(reqCtx, "/process.Process/SendSignal", req, nil, "")
+	if err != nil {
+		if isProcessNotFoundError(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+func (c *Commands) Connect(ctx context.Context, pid uint32, opts *CommandConnectOpts) (*CommandHandle, error) {
+	if opts == nil {
+		opts = &CommandConnectOpts{}
+	}
+	user := ""
+	req := &process.ConnectRequest{Process: process.PidSelector(pid)}
+	requestCtx, clearRequestTimeout, cancelRequestTimeout := requestTimeoutStreamContextWithSignal(ctx, opts.Signal, c.requestTimeoutFromConnectOpts(opts))
+	streamCtx, streamCancel := streamContext(requestCtx, opts.TimeoutMs, defaultProcessConnectionTimeoutMs)
+	body, err := c.connectServerStream(streamCtx, "/process.Process/Connect", req, user)
+	if err != nil {
+		streamCancel()
+		cancelRequestTimeout()
+		return nil, err
+	}
+
+	ch := make(chan streamEnvelope, 16)
+	go readStreamEnvelopesWithLogger(body, ch, c.connectionConfig.Logger)
+
+	firstMsg, ok, err := waitForFirstEvent(ch, c.requestTimeoutFromConnectOpts(opts))
+	if err != nil {
+		streamCancel()
+		cancelRequestTimeout()
+		body.Close()
+		return nil, err
+	}
+	if !ok {
+		streamCancel()
+		cancelRequestTimeout()
+		body.Close()
+		return nil, fmt.Errorf("Expected start event")
+	}
+	clearRequestTimeout()
+
+	var firstEvent process.ProcessEvent
+	if err := json.Unmarshal(firstMsg, &firstEvent); err != nil {
+		streamCancel()
+		body.Close()
+		return nil, fmt.Errorf("failed to parse connect start event: %w", err)
+	}
+	if firstEvent.Start == nil {
+		streamCancel()
+		body.Close()
+		return nil, fmt.Errorf("Expected start event")
+	}
+
+	cancelCtx, cancel := context.WithCancel(ctx)
+	handle := newCommandHandle(pid, func() {
+		cancel()
+		streamCancel()
+		body.Close()
+	}, func() (bool, error) {
+		return c.Kill(ctx, pid, nil)
+	}, opts.OnStdout, opts.OnStderr)
+
+	go func() {
+		defer cancelRequestTimeout()
+		defer streamCancel()
+		defer body.Close()
+		for {
+			select {
+			case <-cancelCtx.Done():
+				return
+			case msg, ok := <-ch:
+				if !ok {
+					if err := streamCtx.Err(); err != nil {
+						handle.setWaitError(wrapProcessError(envd.HandleStreamContextError(err)))
+						return
+					}
+					handle.setWaitError(errProcessExitedWithoutResult)
+					return
+				}
+				if msg.err != nil {
+					handle.setWaitError(wrapProcessError(msg.err))
+					return
+				}
+				c.handleProcessEvent(msg.payload, handle)
+				if handle.hasExitCode() {
+					return
+				}
+			}
+		}
+	}()
+
+	return handle, nil
+}
+
+// Run provides the JS/Python-style single-entry command surface. It returns a
+// foreground CommandResult by default, and returns a CommandHandle when
+// opts.Background is true.
+func (c *Commands) Run(ctx context.Context, cmd string, opts *CommandStartOpts) (commandExecution, error) {
+	if opts != nil && opts.Background {
+		return c.start(ctx, cmd, opts)
+	}
+	handle, err := c.start(ctx, cmd, opts)
+	if err != nil {
+		return nil, err
+	}
+	return handle.Wait()
+}
+
+func (c *Commands) start(ctx context.Context, cmd string, opts *CommandStartOpts) (*CommandHandle, error) {
+	if opts == nil {
+		opts = &CommandStartOpts{}
+	}
+	stdinEnabled, stdinExplicit := resolveCommandStdin(opts)
+	if stdinExplicit && !stdinEnabled && !versionGTE(c.envdVersion, envd.EnvdCommandsStdin) {
+		return nil, fmt.Errorf("Sandbox envd version %s can't specify stdin, it's always turned on. Please rebuild your template if you need this feature.", c.envdVersion)
+	}
+
+	user := opts.User
+	envs := opts.Envs
+
+	startReq := &process.StartRequest{
+		Process: &process.ProcessConfig{
+			Cmd:  "/bin/bash",
+			Args: []string{"-l", "-c", cmd},
+			Envs: envs,
+			Cwd:  opts.Cwd,
+		},
+		Stdin: stdinEnabled,
+	}
+
+	requestCtx, clearRequestTimeout, cancelRequestTimeout := requestTimeoutStreamContextWithSignal(ctx, opts.Signal, c.requestTimeoutFromStartOpts(opts))
+	streamCtx, streamCancel := streamContext(requestCtx, opts.TimeoutMs, defaultProcessConnectionTimeoutMs)
+	body, err := c.connectServerStream(streamCtx, "/process.Process/Start", startReq, user)
+	if err != nil {
+		streamCancel()
+		cancelRequestTimeout()
+		return nil, err
+	}
+
+	// Read the first envelope to get the PID
+	ch := make(chan streamEnvelope, 16)
+	go readStreamEnvelopesWithLogger(body, ch, c.connectionConfig.Logger)
+
+	firstMsg, ok, err := waitForFirstEvent(ch, c.requestTimeoutFromStartOpts(opts))
+	if err != nil {
+		streamCancel()
+		cancelRequestTimeout()
+		body.Close()
+		return nil, err
+	}
+	if !ok {
+		streamCancel()
+		cancelRequestTimeout()
+		body.Close()
+		return nil, fmt.Errorf("Expected start event")
+	}
+	clearRequestTimeout()
+
+	var event process.ProcessEvent
+	if err := json.Unmarshal(firstMsg, &event); err != nil {
+		streamCancel()
+		body.Close()
+		return nil, fmt.Errorf("failed to parse start event: %w", err)
+	}
+	if event.Start == nil {
+		streamCancel()
+		body.Close()
+		return nil, fmt.Errorf("Expected start event")
+	}
+
+	pid := event.Start.Pid
+	cancelCtx, cancel := context.WithCancel(ctx)
+
+	handle := newCommandHandle(pid, func() {
+		cancel()
+		streamCancel()
+		body.Close()
+	}, func() (bool, error) {
+		return c.Kill(ctx, pid, nil)
+	}, opts.OnStdout, opts.OnStderr)
+
+	go func() {
+		defer cancelRequestTimeout()
+		defer streamCancel()
+		defer body.Close()
+		for {
+			select {
+			case <-cancelCtx.Done():
+				return
+			case msg, ok := <-ch:
+				if !ok {
+					if err := streamCtx.Err(); err != nil {
+						handle.setWaitError(wrapProcessError(envd.HandleStreamContextError(err)))
+						return
+					}
+					handle.setWaitError(errProcessExitedWithoutResult)
+					return
+				}
+				if msg.err != nil {
+					handle.setWaitError(wrapProcessError(msg.err))
+					return
+				}
+				c.handleProcessEvent(msg.payload, handle)
+				if handle.hasExitCode() {
+					return
+				}
+			}
+		}
+	}()
+
+	return handle, nil
+}
+
+func (c *Commands) requestTimeout(opts *CommandRequestOpts) *int {
+	if opts != nil && opts.RequestTimeoutMs != nil {
+		return opts.RequestTimeoutMs
+	}
+	if c.connectionConfig.RequestTimeoutMs <= 0 {
+		return nil
+	}
+	timeout := c.connectionConfig.RequestTimeoutMs
+	return &timeout
+}
+
+func (c *Commands) requestTimeoutFromStartOpts(opts *CommandStartOpts) *int {
+	if opts != nil && opts.RequestTimeoutMs != nil {
+		return opts.RequestTimeoutMs
+	}
+	if c.connectionConfig.RequestTimeoutMs <= 0 {
+		return nil
+	}
+	timeout := c.connectionConfig.RequestTimeoutMs
+	return &timeout
+}
+
+func (c *Commands) requestTimeoutFromConnectOpts(opts *CommandConnectOpts) *int {
+	if opts != nil && opts.RequestTimeoutMs != nil {
+		return opts.RequestTimeoutMs
+	}
+	if c.connectionConfig.RequestTimeoutMs <= 0 {
+		return nil
+	}
+	timeout := c.connectionConfig.RequestTimeoutMs
+	return &timeout
+}
+
+func streamContext(ctx context.Context, timeoutMs *int, defaultTimeoutMs int) (context.Context, context.CancelFunc) {
+	if timeoutMs == nil {
+		return context.WithTimeout(ctx, time.Duration(defaultTimeoutMs)*time.Millisecond)
+	}
+	if *timeoutMs == 0 {
+		return context.WithCancel(ctx)
+	}
+	return context.WithTimeout(ctx, time.Duration(*timeoutMs)*time.Millisecond)
+}
+
+func requestTimeoutStreamContext(ctx context.Context, timeoutMs *int) (context.Context, func(), context.CancelFunc) {
+	if timeoutMs == nil || *timeoutMs == 0 {
+		return ctx, func() {}, func() {}
+	}
+
+	requestCtx, cancel := context.WithCancel(ctx)
+	timer := time.AfterFunc(time.Duration(*timeoutMs)*time.Millisecond, cancel)
+
+	return requestCtx, func() {
+			timer.Stop()
+		}, func() {
+			timer.Stop()
+			cancel()
+		}
+}
+
+func waitForFirstEvent(ch <-chan streamEnvelope, timeoutMs *int) (json.RawMessage, bool, error) {
+	if timeoutMs == nil || *timeoutMs == 0 {
+		msg, ok := <-ch
+		if !ok {
+			return nil, false, nil
+		}
+		if msg.err != nil {
+			return nil, false, wrapProcessError(msg.err)
+		}
+		return msg.payload, true, nil
+	}
+
+	select {
+	case msg, ok := <-ch:
+		if !ok {
+			return nil, false, nil
+		}
+		if msg.err != nil {
+			return nil, false, wrapProcessError(msg.err)
+		}
+		return msg.payload, true, nil
+	case <-time.After(time.Duration(*timeoutMs) * time.Millisecond):
+		return nil, false, wrapProcessError(envd.HandleRequestTimeoutError())
+	}
+}
+
+func (c *Commands) handleProcessEvent(msg json.RawMessage, handle *CommandHandle) {
+	var event process.ProcessEvent
+	if err := json.Unmarshal(msg, &event); err != nil {
+		return
+	}
+	if event.Data != nil {
+		if len(event.Data.Stdout) > 0 {
+			handle.appendStdout(bytesToValidString(event.Data.Stdout))
+		}
+		if len(event.Data.Stderr) > 0 {
+			handle.appendStderr(bytesToValidString(event.Data.Stderr))
+		}
+	}
+	if event.End != nil {
+		handle.setEnd(int(event.End.ExitCode), event.End.Error)
+	}
+}
+
+func bytesToValidString(data []byte) string {
+	return strings.ToValidUTF8(string(data), "\uFFFD")
+}
+
+func wrapProcessError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return wrapProcessError(envd.HandleStreamContextError(err))
+	}
+	if isProcessNotFoundError(err) {
+		return &shared.NotFoundError{
+			SandboxError: shared.SandboxError{Message: processErrorMessage(err)},
+		}
+	}
+
+	var rpcErr *envd.RpcError
+	if errors.As(err, &rpcErr) {
+		switch rpcErr.Code {
+		case "invalid_argument":
+			return &shared.InvalidArgumentError{SandboxError: shared.SandboxError{Message: rpcErr.Message}}
+		case "unauthenticated":
+			return &shared.AuthenticationError{Message: rpcErr.Message}
+		case "unavailable", "canceled", "deadline_exceeded":
+			return &shared.TimeoutError{SandboxError: shared.SandboxError{Message: rpcErr.Message}}
+		case "resource_exhausted":
+			return &shared.RateLimitError{SandboxError: shared.SandboxError{Message: rpcErr.Message}}
+		default:
+			return &shared.SandboxError{Message: fmt.Sprintf("%s: %s", rpcErr.Code, rpcErr.Message)}
+		}
+	}
+
+	return err
+}
+
+func isProcessNotFoundError(err error) bool {
+	var notFoundErr *shared.NotFoundError
+	if errors.As(err, &notFoundErr) {
+		return true
+	}
+
+	var rpcErr *envd.RpcError
+	if errors.As(err, &rpcErr) {
+		return rpcErr.Code == "not_found" || strings.Contains(strings.ToLower(rpcErr.Message), "not found")
+	}
+
+	return false
+}
+
+func processErrorMessage(err error) string {
+	var notFoundErr *shared.NotFoundError
+	if errors.As(err, &notFoundErr) && notFoundErr.SandboxError.Message != "" {
+		return notFoundErr.SandboxError.Message
+	}
+
+	var rpcErr *envd.RpcError
+	if errors.As(err, &rpcErr) && rpcErr.Message != "" {
+		return rpcErr.Message
+	}
+
+	return err.Error()
+}
+
+// versionGTE returns true if version >= minVersion (semver comparison).
+func versionGTE(version, minVersion string) bool {
+	if version == "" {
+		return true // assume latest if unknown
+	}
+	parseSemver := func(v string) (int, int, int) {
+		var major, minor, patch int
+		fmt.Sscanf(v, "%d.%d.%d", &major, &minor, &patch)
+		return major, minor, patch
+	}
+	maj1, min1, pat1 := parseSemver(version)
+	maj2, min2, pat2 := parseSemver(minVersion)
+	if maj1 != maj2 {
+		return maj1 > maj2
+	}
+	if min1 != min2 {
+		return min1 > min2
+	}
+	return pat1 >= pat2
+}
+
+func resolveCommandStdin(opts *CommandStartOpts) (enabled bool, explicit bool) {
+	if opts == nil {
+		return false, false
+	}
+	if opts.Stdin != nil {
+		return *opts.Stdin, true
+	}
+	return false, false
+}
