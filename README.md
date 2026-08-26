@@ -134,3 +134,9 @@ The repository documentation lives in:
 - [`docs/sdk-reference/go-sdk/sandbox.mdx`](./docs/sdk-reference/go-sdk/sandbox.mdx)
 
 If you change public behavior, update the corresponding doc page and matching coverage in [`internal/doctest/`](./internal/doctest/) in the same change.
+
+## API Notes
+
+- All public types are generated from the OpenAPI spec; hand-editing generated code is discouraged.
+- The Client uses typed errors - check with errors.As for *APIError to read status and request id.
+
