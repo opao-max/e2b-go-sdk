@@ -5,3 +5,8 @@ demo
 .DS_Store
 *.log
 coverage.out
+
+# Test artifacts
+coverage.out
+*.test
+
